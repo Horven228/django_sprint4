@@ -1,0 +1,253 @@
+from django.contrib.auth import get_user_model
+from django.contrib.auth.decorators import login_required
+from django.core.paginator import Paginator
+from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
+from django.views.decorators.http import require_http_methods
+from django.http import Http404
+from django.views.decorators.csrf import requires_csrf_token
+from django.views.generic import CreateView
+from django.urls import reverse_lazy
+
+from .forms import (
+    CommentForm, PostForm, CustomUserChangeForm, RegistrationForm
+)
+from .models import Category, Comment, Post
+
+User = get_user_model()
+POSTS_PER_PAGE = 10
+
+
+def filter_published_posts(queryset):
+    return queryset.filter(
+        is_published=True,
+        pub_date__lte=timezone.now()
+    )
+
+
+def get_page_obj(request, post_list, posts_per_page):
+    paginator = Paginator(post_list, posts_per_page)
+    page_number = request.GET.get('page')
+    return paginator.get_page(page_number)
+
+
+@requires_csrf_token
+def csrf_failure(request, reason=""):
+    return render(request, 'pages/403.html', status=403)
+
+
+def index(request):
+    post_list = Post.published.select_related(
+        'category', 'author', 'location'
+    ).with_comment_count().order_by('-pub_date')
+
+    page_obj = get_page_obj(request, post_list, POSTS_PER_PAGE)
+    return render(request, 'blog/index.html', {'page_obj': page_obj})
+
+
+def post_detail(request, post_id):
+    post = get_object_or_404(
+        Post.objects.select_related('category', 'location', 'author'),
+        pk=post_id
+    )
+
+    user_is_author = post.author == request.user
+    post_is_available = (
+        post.is_published
+        and post.pub_date <= timezone.now()
+        and post.category.is_published
+    )
+
+    if not (post_is_available or user_is_author):
+        raise Http404("Пост не найден")
+
+    if user_is_author:
+        comments = post.comments.all().select_related('author')
+    else:
+        comments = post.comments.filter(
+            is_published=True
+        ).select_related('author')
+
+    comments = comments.order_by('created_at')
+    form = CommentForm()
+
+    return render(
+        request,
+        'blog/detail.html',
+        {
+            'post': post,
+            'comments': comments,
+            'form': form
+        }
+    )
+
+
+def category_posts(request, category_slug):
+    category = get_object_or_404(
+        Category,
+        slug=category_slug,
+        is_published=True
+    )
+    post_list = Post.objects.filter(category=category).with_comment_count()
+    post_list = post_list.published().order_by('-pub_date')
+
+    page_obj = get_page_obj(request, post_list, 10)
+    return render(
+        request,
+        'blog/category.html',
+        {'category': category, 'page_obj': page_obj}
+    )
+
+
+def profile(request, username):
+    user = get_object_or_404(User, username=username)
+    posts = user.posts.with_comment_count()
+    if request.user != user:
+        posts = posts.published()
+    posts = posts.order_by('-pub_date')
+
+    page_obj = get_page_obj(request, posts, 10)
+    return render(
+        request,
+        'blog/profile.html',
+        {'profile': user, 'page_obj': page_obj}
+    )
+
+
+@login_required
+def edit_profile(request):
+    if request.method == 'POST':
+        form = CustomUserChangeForm(
+            request.POST,
+            instance=request.user,
+        )
+        if form.is_valid():
+            form.save()
+            return redirect('blog:profile', username=request.user.username)
+    else:
+        form = CustomUserChangeForm(instance=request.user)
+    return render(request, 'blog/edit_profile.html', {'form': form})
+
+
+@login_required
+def post_create(request):
+    form = PostForm(request.POST or None, request.FILES or None)
+    if form.is_valid():
+        post = form.save(commit=False)
+        post.author = request.user
+        post.save()
+        return redirect('blog:profile', username=request.user.username)
+    return render(request, 'blog/create.html', {'form': form})
+
+
+@login_required
+def post_edit(request, post_id):
+    post = get_object_or_404(Post, pk=post_id)
+    if post.author != request.user:
+        return redirect('blog:post_detail', post_id=post_id)
+
+    form = PostForm(
+        request.POST or None,
+        files=request.FILES or None,
+        instance=post
+    )
+
+    if form.is_valid():
+        form.save()
+        return redirect('blog:post_detail', post_id=post_id)
+
+    return render(
+        request,
+        'blog/create.html',
+        {'form': form, 'post': post}
+    )
+
+
+@login_required
+@require_http_methods(['POST'])
+def add_comment(request, post_id):
+    post = get_object_or_404(Post, pk=post_id)
+    form = CommentForm(request.POST)
+
+    if form.is_valid():
+        comment = form.save(commit=False)
+        comment.post = post
+        comment.author = request.user
+        comment.save()
+        return redirect('blog:post_detail', post_id=post_id)
+
+    return render(
+        request,
+        'blog/detail.html',
+        {
+            'post': post,
+            'comments': post.comments.filter(is_published=True),
+            'form': form
+        }
+    )
+
+
+@login_required
+def edit_comment(request, post_id, comment_id):
+    comment = get_object_or_404(
+        Comment,
+        pk=comment_id,
+        post_id=post_id,
+        author=request.user
+    )
+    form = CommentForm(request.POST or None, instance=comment)
+
+    if form.is_valid():
+        form.save()
+        return redirect('blog:post_detail', post_id=post_id)
+
+    return render(
+        request,
+        'blog/comment.html',
+        {'form': form, 'comment': comment}
+    )
+
+
+@login_required
+def delete_comment(request, post_id, comment_id):
+    comment = get_object_or_404(
+        Comment,
+        pk=comment_id,
+        post_id=post_id,
+        author=request.user
+    )
+
+    if request.method != 'POST':
+        return render(
+            request,
+            'blog/comment.html',
+            {'comment': comment, 'post_id': post_id}
+        )
+
+    comment.delete()
+    return redirect('blog:post_detail', post_id=post_id)
+
+
+@login_required
+def profile_redirect(request):
+    return redirect('blog:profile', username=request.user.username)
+
+
+@login_required
+@require_http_methods(['POST'])
+def delete_post(request, post_id):
+    post = get_object_or_404(Post, pk=post_id)
+    if post.author != request.user:
+        return redirect(
+            'blog:post_detail',
+            post_id=post_id
+        )
+
+    post.delete()
+    return redirect('blog:profile', username=request.user.username)
+
+
+class SignUpView(CreateView):
+    form_class = RegistrationForm
+    template_name = 'registration/registration_form.html'
+    success_url = reverse_lazy('login')
